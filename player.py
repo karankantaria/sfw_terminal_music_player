@@ -26,8 +26,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from rich.live import Live
+
 from spotify_client import get_client
-from renderer import render_player, render_panic
+from renderer import player_renderable, panic_renderable
 from waveform import generate
 
 # ── Panic-mode fake code (same style as epub reader) ─────────────────────────
@@ -277,7 +279,8 @@ def _get_key() -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-_REFRESH_HZ = 1.0   # seconds between display updates
+_RENDER_HZ   = 10    # frames per second — waveform animation rate
+_SPOTIFY_POLL = 2.0  # seconds between Spotify API calls
 
 
 def main() -> None:
@@ -287,20 +290,20 @@ def main() -> None:
         print(f"Failed to connect to Spotify: {exc}")
         sys.exit(1)
 
-    # Shared state
-    key_queue:    queue.Queue = queue.Queue()
-    stop_event:   threading.Event = threading.Event()
+    key_queue:  queue.Queue    = queue.Queue()
+    stop_event: threading.Event = threading.Event()
 
-    # Cached values so we don't hammer the API every frame
+    # Initial state
     track    = client.get_current_track()
     features = client.get_audio_features(track['id']) if track else None
     liked    = client.is_liked(track['id'])            if track else None
     last_id  = track['id'] if track else None
 
-    in_panic      = False
-    panic_offset  = 0
-    panic_shown   = 20
-    t_start       = time.monotonic()
+    in_panic     = False
+    panic_offset = 0
+    panic_shown  = 20
+    t_start      = time.monotonic()
+    last_poll    = time.monotonic()
 
     def input_loop() -> None:
         while not stop_event.is_set():
@@ -311,37 +314,41 @@ def main() -> None:
 
     threading.Thread(target=input_loop, daemon=True).start()
 
-    while True:
-        now      = time.monotonic() - t_start
+    with Live(screen=True, refresh_per_second=_RENDER_HZ) as live:
+      while True:
+        now = time.monotonic() - t_start
+
+        # Poll Spotify on interval (not every frame)
+        if time.monotonic() - last_poll >= _SPOTIFY_POLL:
+            if hasattr(client, 'tick'):
+                client.tick(int(_SPOTIFY_POLL * 1000))
+            fresh = client.get_current_track()
+            if fresh:
+                track = fresh
+                if fresh['id'] != last_id:
+                    last_id  = fresh['id']
+                    features = client.get_audio_features(last_id)
+                    liked    = client.is_liked(last_id)
+            else:
+                track = None
+            last_poll = time.monotonic()
+
+        # Render every frame
         wv_lines = generate(
             energy=(features or {}).get('energy', 0.5),
-            width=60,   # renderer trims/pads to terminal width
+            width=80,
             t=now,
         )
 
-        # Tick mock progress if using MockClient
-        if hasattr(client, 'tick'):
-            client.tick(int(_REFRESH_HZ * 1000))
-
-        # Re-fetch track state periodically
-        fresh = client.get_current_track()
-        if fresh:
-            track = fresh
-            if fresh['id'] != last_id:
-                last_id  = fresh['id']
-                features = client.get_audio_features(last_id)
-                liked    = client.is_liked(last_id)
-        else:
-            track = None
-
-        # Render
         if in_panic:
-            panic_shown = render_panic(panic_offset, _PANIC_CODE)
+            renderable, panic_shown = panic_renderable(panic_offset, _PANIC_CODE)
         else:
-            render_player(track, features, wv_lines, liked)
+            renderable = player_renderable(track, features, wv_lines, liked)
 
-        # Drain all queued keypresses accumulated during this sleep
-        time.sleep(_REFRESH_HZ)
+        live.update(renderable)
+        time.sleep(1 / _RENDER_HZ)
+
+        # Drain keys accumulated this frame
         keys = []
         while not key_queue.empty():
             try:
@@ -355,7 +362,6 @@ def main() -> None:
                 max_p = max(0, _PANIC_TOTAL - panic_shown)
                 if key in ('q', 'QUIT'):
                     stop_event.set()
-                    os.system('cls' if os.name == 'nt' else 'clear')
                     return
                 elif key == 'ESC':
                     in_panic = False
@@ -385,7 +391,6 @@ def main() -> None:
             # ── Player controls ──────────────────────────────────────
             if key in ('q', 'QUIT'):
                 stop_event.set()
-                os.system('cls' if os.name == 'nt' else 'clear')
                 return
             elif key == ' ':
                 client.play_pause()
